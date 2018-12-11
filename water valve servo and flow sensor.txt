@@ -1,0 +1,413 @@
+/*
+ * Water Valve Code
+ * By: Max Hernandez--Sparrow Technologies
+ * ESET 420 - SPRING 2018
+ */
+/*
+ * MSP430FR2311
+ * Program Starts upon Xbee wake up (UART RXD buffer interrupt sets Pinawake=1) to open the water valve, take water flow readings, and Battery level readings.
+ * Creates packets to send via UART TX buffer to the XBee.
+ */
+#include <msp430.h>
+#include <math.h>
+#include <stdio.h>
+
+///Initilaize Global variables
+unsigned int Startedmsg[]={0x7E,0x00,0x1D,0x01,0x00,0x00,0x00,0x00,0x30,0x30,0x30,0x35,0x20,0x57,0x61,0x74,0x65,0x72,0x69,0x6E,0x67,0x20,0x73,0x74,0x61,0x72,0x74,0x65,0x64,0x21,0x21,0x21,0x5E};
+unsigned int Waterdata[33]={0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x30,0x30,0x30,0x35,0x20,0x57,0x20,0x30,0x30,0x30,0x20,0x42,0x31,0x20,0x30,0x30,0x30,0x20,0x42,0x32,0x20,0x30,0x30,0x30,0x00};
+unsigned int Errormsg[]={0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x30,0x30,0x30,0x35,0x20,0x45,0x72,0x72,0x6F,0x72,0x20,0x42,0x31,0x20,0x30,0x30,0x30,0x20,0x42,0x32,0x20,0x30,0x30,0x30,0x00};
+int wateringtime=0;
+int drytime=0;
+unsigned char RXData =0;
+volatile unsigned int Counter=0;
+int RTS = 0;
+static const int Size=33;
+int Pinawake=0;
+int ADC_Done=0;
+int ADC=0;
+int BA1; // Battery 1 Level Value
+int BA2; // Battery 2 Level Value
+int WL=0; // Water Level Value
+unsigned int counterflo=0; // Water Flow Pulse Values
+unsigned int Start_Bytes[] = {0x7E,0x00,0x1D};
+unsigned int Checksum_Data=0;
+
+///Pin Setup for 6V Battery
+void InitP1_2();
+void InitP1_2(){
+    P1DIR  &=~BIT2;    // P1.2 as input
+    P1SEL0 |= BIT2;    // GENERAL I/O PIN
+    P1SEL1 |= BIT2;
+}
+
+///Pin Setup for 3.7V Battery
+void InitP1_3();
+void InitP1_3(){
+    P1DIR  &=~BIT3;    // P1.3 as input
+    P1SEL0 |= BIT3;    // GENERAL I/O PIN
+    P1SEL1 |= BIT3;
+}
+
+///Configure UART to baud rate 9600 to communicate with Xbee Radio
+void initUART(void);
+void initUART(void){
+    __bis_SR_register(SCG0);                   // disable FLL
+    CSCTL3 |= SELREF__REFOCLK;                 // Set REFO as FLL reference source
+    CSCTL1 = DCOFTRIMEN_1 | DCOFTRIM0 | DCOFTRIM1 | DCORSEL_3;// DCOFTRIM=3, DCO Range = 8MHz
+    CSCTL2 = FLLD_0 + 243;                     // DCODIV = 8MHz
+    __delay_cycles(3);
+    __bic_SR_register(SCG0);                   // enable FLL
+    CSCTL4 = SELMS__DCOCLKDIV | SELA__REFOCLK; // set default REFO(~32768Hz) as ACLK source, ACLK = 32768Hz
+
+    UCA0CTLW0 |= UCSWRST;       //Software reset enable. eUSCI logic held in reset state.
+    UCA0CTLW0 |= UCSSEL__SMCLK; //set SMCLK for eUSCI
+
+    // Baud Rate calculation, 9600 baud rate
+    UCA0BR0 = 52;
+    UCA0BR1 = 0x00;
+
+    UCA0MCTLW = 0x4900 | UCOS16 | UCBRF_1;
+    UCA0CTLW0 &= ~UCSWRST; // Initialize eUSCI for UART communication
+    UCA0IE |= UCRXIE;      // Enable USCI_A0 RX interrupt
+    UCA0IFG |= UCRXIFG;    // Interrupt pending
+
+    P1SEL0 |= BIT6;        // UART Pin RXD
+    P1SEL1 &= ~BIT6;
+    P1SEL0 |= BIT7;        // UART Pin TXD
+    P1SEL1 &= ~BIT7;
+}
+
+///Set up ADC for P1.3 (A3 channel) 3.7V Battery Level
+void ADC_BA1();
+void ADC_BA1(){
+    ADCCTL0 |= ADCSHT_7 | ADCON;             // ADC Sample and Hold Time = 192 cycles, ADC on bit set
+    ADCCTL1 |= ADCSHP  | ADCSSEL_1;          //Sample and Hold pulse mode select,  Clk = ACLK
+    ADCCTL2 |= ADCRES_1;                     //10 - bit Resolution
+    ADCIE   |= ADCIE0;                       //Interrupt Enable
+    ADCMCTL0|= ADCINCH_3| ADCSREF_0;         //A0 channel select, Vref = VCC
+
+    PMMCTL0_H = PMMPW_H;                     // Unlock the PMM (power management module) registers
+    PMMCTL2 |= INTREFEN_0;                   // disable internal reference
+
+    ADCCTL0 |= ADCENC | ADCSC;               // Sampling and conversion start, software trigger to start ADC
+}
+
+///Set up ADC for P1.2 (A2 channel) 6V Battery Level
+void ADC_BA2();
+void ADC_BA2(){
+    ADCCTL1 |= ADCSHP  | ADCSSEL_1;          //Sample and Hold pulse mode select,  Clk = ACLK
+    ADCCTL2 |= ADCRES_1;                     //10 - bit Resolution
+    ADCIE   |= ADCIE0;                       //Interrupt Enable
+    ADCCTL0 &= ~ADCENC;
+    ADCMCTL0= (ADCINCH_0 & ~0x0F);
+    ADCMCTL0|= ADCINCH_2| ADCSREF_0;         //A2 channel select, Vref = VCC
+
+    PMMCTL0_H = PMMPW_H;                     // Unlock the PMM (power management module) registers
+    PMMCTL2 |= INTREFEN_0;                   // disable internal reference
+    ADCCTL0 &= ~ADCENC;
+    ADCCTL0 |= ADCENC | ADCSC;               // Sampling and conversion start, software trigger to start ADC
+}
+
+/*
+* Cal_checksum function takes the argument of an array
+* and int(size of packet) to calculate the checksum that is required by
+* the api frame to send a packet via UART to the zigbee.
+* Returns checksum to add to the end of the packet.
+*
+* Checksum is calculated by:
+* 1. Add all bytes of the packet, except the start delimiter 0x7E and the length (the second and third bytes).
+* 2. Keep only the lowest 8 bits from the result.
+* 3. Subtract this quantity from 0xFF.
+*/
+int Cal_Checksum(unsigned int*, int);
+int Cal_Checksum(unsigned int *arr, int size_checksum){
+    unsigned int sum = 0;
+    int counter_checksum=0;
+    unsigned int low8bits=0, checksum=0;
+    for (counter_checksum = 0; counter_checksum < size_checksum; counter_checksum++) // Iterate through all elements
+    sum += arr[counter_checksum];
+    low8bits = sum & 0xFF;      // get the lower 8 bits of the sum
+    checksum = 0xFF - low8bits; // subtract 0xFF - lower 8 bits of the sum to get checksum byte
+    return checksum;            // return checksum value when called
+}
+
+///Turn on Hi-side Switch P2.7
+void HisideswitchOn(void);
+void HisideswitchOn(void){
+    P2DIR |= BIT7;          // BIT7=1 as output, for V_ON on board
+    P2OUT |= BIT7;          // P2.7 output is high
+}
+
+///Turn off Hi-side Switch P2.7
+void HisideswitchOff(void);
+void HisideswitchOff(void){
+    P2OUT &= ~BIT7;         // Clear bit to turn off hi-side switch
+}
+
+///Initialize Pins For Flow Sensor
+void Initflowpins(void);
+void Initflowpins(void){
+    P1DIR &=~ BIT1;    // BIT1=0, P1.1 as input
+    /*
+    * MAKE SURE to disable the pullup/pulldown resistor with '&= ~'. If not, the input pin on the board will not read from the flow sensor when water flows, and code won't go into interrupt.
+    * If you enable it, signal from sensor will be attenuated and Vpp will be 1.25V which is not enough to be read from P1.1.
+    * When disabled, Vpp=2.8V
+    */
+    P1REN &= ~BIT1;    // BIT1=0, Disable P1.1 pullup or pulldown resistor
+    P1IES &= ~BIT1;    // P1.1 lo/Hi edge select
+    P1IE |= BIT1;      // P1.1 interrupt enabled
+    P1IFG &= ~BIT1;    // P1.1 IFG cleared
+}
+
+/////Initialize Pins For Servo Motor
+void Initservopins(void);
+void Initservopins(void){
+    P2DIR |= BIT0 ;    // Set PWM pin (P2.0) as output
+    P2SEL0 |= BIT0 ;   // Set P2.0 as primary function TB1.1
+}
+
+///Function to Open Water Valve
+void ServoOpen(void);
+void ServoOpen(void){
+    TB1CCR0 = 20000-1;                        // PWM Period is 20ms or (20,000/1,000,000 Hz)
+    TB1CTL = TBSSEL__SMCLK | ID__8 | MC__UP | TBCLR; // SMCLK, Divide clock by 8 to have 1 MHz, up mode, clear TBR
+    TB1CCTL1 = OUTMOD_7;                      // CCR1 reset/set
+    TB1CCR1 = 2650;                           // CCR1 PWM duty cycle, servo opens (turns clockwise)
+}
+
+///Function to Close Water Valve
+void ServoClose(void);
+void ServoClose(void){
+    TB1CCTL1 = OUTMOD_7;                      // CCR1 reset/set
+    TB1CCR1 = 500;                            // CCR1 PWM duty cycle, servo closes (turns counterclockwise)
+}
+
+
+int main(void)
+{
+    WDTCTL = WDTPW | WDTHOLD;     // Stop WDT
+    PM5CTL0 &= ~LOCKLPM5;         // Disable the GPIO power-on default high-impedance mode to activate previously configured port settings
+
+    Initservopins();              //The servo pin must be initialized outside the while(1) loop
+    initUART();
+    Initflowpins();
+    InitP1_2();                   //To read 6V bat lvl
+    InitP1_3();                   //To read 3.7V bat lvl
+    __bis_SR_register(GIE);       //Keep GIE here so that 'if' statements can work properly
+
+    while(1){
+        //Pinawake =1;     // This line can be uncommented for debugging purposes. It would simulate the Zigbee being awake up at all times
+        counterflo = 0;    // Clear counterflo here. If cleared at the end of sending watering data, it will go into 'if(counterflo==0)' condition
+
+        if (Pinawake==1){  // While Xbee module RXD
+            HisideswitchOn();
+            __delay_cycles(10); // Settling time for switch
+            Pinawake=0;
+            ServoOpen();
+            __delay_cycles(10000000); // Needed so that function can keep opening servo to full 180 degrees
+
+            //IF WATER FLOWS
+            if(counterflo > 2){
+                //'Watering started' message is sent
+                while(Counter<Size){  // keeps sending the message counter as long as message counter is less than the size indicating that there is more data to be sent.
+                    UCA0TXBUF = Startedmsg[Counter];
+                    while(UCA0STATW&UCBUSY); // This statement ensures that the data is placed on the line successfully
+                    Counter++;               // counter is incremented so that next character is sent
+                }
+                Counter=0;                   // Clear Counter
+                while(wateringtime<180){     // Water for 180 seconds
+                    __delay_cycles(8000000);
+                    wateringtime++;
+                }
+                if(wateringtime==180){
+                    ServoClose();
+                    __delay_cycles(12000000);
+                    WL = counterflo/10;
+
+                    // Packet positions 15, 16, 17 are for the 3 digit number of the water level
+                    Waterdata[15] = (WL/100) + 0x30; // 100s place digit, convert from decimal to ascii
+                    Waterdata[16] = (WL/10)%10 +0x30; // 10s place convert from decimal to ascii
+                    Waterdata[17] = (WL%10) +0x30;// 1s place digit convert from decimal to ascii
+
+                    ADC_BA1();
+                    __bis_SR_register(GIE);
+                    while(ADC_Done==0){
+                       // wait till ADC conversion done
+                                      }
+                    BA1 = (ADC*(float).09775);
+                    // Packet positions 22, 23, 24 are for the 3 digit number of the battery level percentage to be sent via Xbee.
+                    Waterdata[29] = (BA1/100) + 0x30; // 100s place digit, convert from decimal to ascii
+                    Waterdata[30] = (BA1/10)%10 +0x30; // 10s place convert from decimal to ascii
+                    Waterdata[31] = (BA1%10) +0x30;// 1s place digit convert from decimal to ascii
+                    ADC_Done =0;
+                    __bis_SR_register(GIE);
+
+                    ADC_BA2();
+                    while(ADC_Done==0){
+                        // wait till ADC conversion done
+                                      }
+                    BA2=(ADC* (float).09775);
+                    // Packet positions 29, 30, 31 are for the 3 digit number of the battery level percentage to be sent via Xbee.
+                    Waterdata[22] = (BA2/100) + 0x30; // 100s place digit, convert from decimal to ascii
+                    Waterdata[23] = (BA2/10)%10 +0x30; // 10s place convert from decimal to ascii
+                    Waterdata[24] = (BA2%10) +0x30; // 1s place digit convert from decimal to ascii
+                    ADC_Done = 0;
+
+                    Checksum_Data = Cal_Checksum(Waterdata,Size); // Call checksum function with Packet and Size as inputs and return checksum value
+                    Waterdata[0]= Start_Bytes[0]; // Store start bit in packet
+                    Waterdata[1]= Start_Bytes[1]; // Store length MSB in packet
+                    Waterdata[2]= Start_Bytes[2]; // Store length LSB in packet
+                    Waterdata[32]= Checksum_Data; // Put Checksum_Data in last position of the array
+
+                    // Packet is complete and Ready To Send to the UART buffer.
+                    RTS = 1;
+                    if (RTS ==1){
+                        while(Counter<Size){
+                            UCA0TXBUF = Waterdata[Counter];
+                            while(UCA0STATW&UCBUSY);
+                            Counter++;
+                                           }
+                           HisideswitchOff();
+                           Counter = 0;
+                           RTS = 0;
+                           Pinawake = 0;
+                           wateringtime = 0;
+                           WL = 0;
+                                } // Closing bracket for RTS==1
+                    } // Closing bracket for if wateringtime==180
+            } //close counterflo > 2
+
+            //IF WATER DOES NOT FLOW
+            if(counterflo==0)
+            {
+                while(drytime<3) { // Keep valve open for desired amount of time
+                    __delay_cycles(8000000);
+                    drytime++;
+                    __bis_SR_register(GIE);
+                                    }
+                if(drytime==3){
+                    ServoClose();
+                    __delay_cycles(12000000);
+
+                    /////WATERING ERROR MSG: 0005 Err BA1 000 BA2 000 /////
+                    ADC_BA1();
+                    __bis_SR_register(GIE);
+                    while(ADC_Done==0){
+                        // wait till ADC done
+                                      }
+                    BA1 = (ADC*(float).09775);
+                    // Packet positions 22, 23, 24 are for the 3 digit number of the battery level percentage to be sent to via the Xbee.
+                    Errormsg[22] = (BA1/100) + 0x30; // 100s place digit, convert from decimal to ascii
+                    Errormsg[23] = (BA1/10)%10 +0x30; // 10s place convert from decimal to ascii
+                    Errormsg[24] = (BA1%10) +0x30;// 1s place digit convert from decimal to ascii
+                    ADC_Done =0;
+                    __bis_SR_register(GIE);
+
+                    ADC_BA2();
+                    while(ADC_Done==0){
+                        // wait till ADC conversion done
+                                      }
+                    BA2=(ADC* (float).09775);
+                    // Packet positions 29, 30, 31 are for the 3 digit number of the battery level percentage to be sent to via the Xbee.
+                    Errormsg[29] = (BA2/100) + 0x30; // 100s place digit, convert from decimal to ascii
+                    Errormsg[30] = (BA2/10)%10 +0x30; // 10s place convert from decimal to ascii
+                    Errormsg[31] = (BA2%10) +0x30;// 1s place digit convert from decimal to ascii
+                    ADC_Done = 0;
+
+                    Checksum_Data = Cal_Checksum(Errormsg,Size); // Call checksum function with Packet and Size as inputs and return checksum value
+                    Errormsg[0]= Start_Bytes[0]; // Store start bit in packet
+                    Errormsg[1]= Start_Bytes[1]; // Store length MSB in packet
+                    Errormsg[2]= Start_Bytes[2]; // Store length LSB in packet
+                    Errormsg[32]= Checksum_Data; // Put Checksum_Data in last position of the array
+
+                    // Packet is complete and Ready To Send to the UART buffer.
+                    RTS = 1;
+                    if (RTS ==1){
+                        while(Counter<Size){
+                            UCA0TXBUF = Errormsg[Counter];
+                            while(UCA0STATW&UCBUSY);
+                            Counter++;
+                                           }
+                            HisideswitchOff();
+                            Counter = 0;
+                            RTS = 0;
+                            Pinawake =0;
+                            counterflo=0;
+                            drytime=0;
+                               } // Closing bracket for RTS==1
+                } // Closing bracket for drytime
+            } // Closing bracket for if counterflo==0
+        } // Closing bracket for Pinawake==1
+    } // Closing bracket for while(1)
+} // Closing bracket for main
+
+#if defined(__TI_COMPILER_VERSION__) || defined(__IAR_SYSTEMS_ICC__)
+#pragma vector=USCI_A0_VECTOR
+__interrupt void USCI_A0_ISR(void)
+#elif defined(__GNUC__)
+void __attribute__ ((interrupt(USCI_A0_VECTOR))) USCI_A0_ISR (void)
+#else
+#error Compiler not supported!
+#endif
+{
+    switch(__even_in_range(UCA0IV,USCI_UART_UCTXCPTIFG))
+    {
+        case USCI_NONE: break;
+        case USCI_UART_UCRXIFG:
+              UCA0IFG &=~ UCRXIFG; // Clear interrupt
+              RXData = UCA0RXBUF;  // Clear buffer
+              Pinawake = 1;
+              break;
+        case USCI_UART_UCTXIFG: break;
+        case USCI_UART_UCSTTIFG: break;
+        case USCI_UART_UCTXCPTIFG: break;
+    }
+}
+
+// Port 1 interrupt service routine
+#if defined(__TI_COMPILER_VERSION__) || defined(__IAR_SYSTEMS_ICC__)
+#pragma vector=PORT1_VECTOR
+__interrupt void Port_1(void)
+#elif defined(__GNUC__)
+void __attribute__ ((interrupt(PORT1_VECTOR))) Port_1 (void)
+#else
+#error Compiler not supported!
+#endif
+{
+    P1IFG &= ~BIT1; // P1.1 IFG cleared
+    counterflo++;   // Increments according to # of pulses detected by flow sensor
+    __bic_SR_register_on_exit(LPM3_bits); // Exit LPM3
+}
+
+// ADC Interrupt Service Routine
+#if defined(__TI_COMPILER_VERSION__) || defined(__IAR_SYSTEMS_ICC__)
+#pragma vector=ADC_VECTOR
+__interrupt void ADC_ISR(void)
+#elif defined(__GNUC__)
+void __attribute__ ((interrupt(ADC_VECTOR))) ADC_ISR (void)
+#else
+#error Compiler not supported!
+#endif
+{
+    switch(__even_in_range(ADCIV,ADCIV_ADCIFG))
+    {
+    case ADCIV_NONE:
+        break;
+    case ADCIV_ADCOVIFG:
+        break;
+    case ADCIV_ADCTOVIFG:
+        break;
+    case ADCIV_ADCHIIFG:
+        break;
+    case ADCIV_ADCLOIFG:
+        break;
+    case ADCIV_ADCINIFG:
+        break;
+    case ADCIV_ADCIFG:
+        ADC = ADCMEM0;
+        ADC_Done =1;
+        __bic_SR_register_on_exit(LPM3_bits); // Exit LPM3
+    default:
+        break;
+    }
+}
